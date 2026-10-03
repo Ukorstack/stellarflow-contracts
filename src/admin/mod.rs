@@ -1,18 +1,85 @@
-pub mod cleanup;
+pub mod cleanup_accounts;
+pub mod cleanup {
+    use super::*;
 
-use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol, TryFromVal, Val, Vec};
+    pub fn cleanup_expired_proposals(env: &Env) -> Result<u32, ContractError> {
+        super::prune::prune_expired_keys(env, super::prune::PruneTarget::EmergencyRevocation)
+    }
+
+    pub fn reclaim_expired_proposal_deposit(
+        env: &Env,
+        maker: &Address,
+    ) -> Result<u32, ContractError> {
+        maker.require_auth();
+        cleanup_expired_proposals(env)
+    }
+}
+
+pub mod prune {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum PruneTarget {
+        EmergencyRevocation,
+    }
+
+    pub fn prune_expired_keys(env: &Env, target: PruneTarget) -> Result<u32, ContractError> {
+        let mut pruned = 0u32;
+        match target {
+            PruneTarget::EmergencyRevocation => {
+                if let Some(proposal) = get_temp_proposal::<EmergencyRevocationProposal>(
+                    env,
+                    &EMERGENCY_REVOCATION_TEMP_KEY,
+                ) {
+                    if proposal_state(env, proposal.proposed_at) == ProposalState::Expired {
+                        env.storage().temporary().remove(&EMERGENCY_REVOCATION_QUORUM_KEY);
+                        remove_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY);
+                        pruned += 1;
+                    }
+                }
+            }
+        }
+        Ok(pruned)
+    }
+}
+
+pub mod timelock_cancellation;
+
+pub use action_queue::{
+    cancel_action, execute_action, get_action_timelock_remaining, get_queued_action,
+    queue_admin_action, DynamicFeeConfigParams, FeeCeilingUpdateParams, QueuedActionPayload,
+    QueuedAdminAction, ADMIN_ACTION_DELAY_SECONDS,
+};
+pub use prune::{
+    bulk_collect_storage_rent, collect_expired_storage_rent, prune_expired_keys,
+    sweep_expired_contract_rent, sweep_inactive_helper_contract_rent, HelperRentRecord,
+    PruneTarget, StorageRentKey,
+};
+pub use timelock_cancellation::{
+    cancel_timelock_proposal_by_council, execute_timelock_proposal, get_cancellation_count,
+    get_timelock_proposal, get_timelock_proposal_status, queue_admin_timelock_proposal,
+    QueuedTimelockProposal, TimelockCancellationKey, TimelockProposalStatus,
+    ADMIN_TIMELOCK_DELAY_SECONDS, TIMELOCK_PROPOSAL_CANCELLED_EVENT,
+};
+
+use soroban_sdk::{contracttype, symbol_short, Address, Bytes, BytesN, Env, Map, Symbol, TryFromVal, Val, Vec};
+use soroban_sdk::xdr::ToXdr;
 use crate::{ContractData, ContractError, DATA_KEY, SIGNERS_KEY, REVOKED_SIGNER_KEY};
 use crate::storage::{SignerKey, RevokedSignerKey};
 use crate::temp_governance::{
-    store_temp_proposal, get_temp_proposal, has_temp_proposal, remove_temp_proposal,
-    EMERGENCY_REVOCATION_TEMP_KEY, DEFAULT_PROPOSAL_TTL, EXTENDED_PROPOSAL_TTL,
+    get_temp_proposal, has_temp_proposal, remove_temp_proposal, store_temp_proposal,
+    DEFAULT_PROPOSAL_TTL, EMERGENCY_REVOCATION_TEMP_KEY, EXTENDED_PROPOSAL_TTL,
 };
+use crate::{ContractData, ContractError, DATA_KEY, REVOKED_SIGNER_KEY, SIGNERS_KEY};
+use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol, TryFromVal, Val, Vec};
 
 pub(crate) const PENDING_OWNER_KEY: Symbol = symbol_short!("PNDOWN");
 pub(crate) const PENDING_ADMIN_KEY: Symbol = symbol_short!("PADMIN");
 pub(crate) const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 
 const ADMIN_CHANGE_TIMELOCK_SECONDS: u64 = 24 * 60 * 60;
+
+const PROPOSAL_EXPIRY_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 // ── Per-action admin nonce map ────────────────────────────────────────────────
 
@@ -69,15 +136,58 @@ fn consume_admin_nonce(
 }
 
 /// Helper function to check if an address is a registered signer.
+///
+/// Signers are registered by `register_signer` into the `SIGNERS_KEY` map
+/// (`Map<Address, ()>` in instance storage); this check reads that same map
+/// so the two paths stay consistent.
 fn _is_signer(env: &Env, addr: &Address) -> bool {
-    let signer_key = SignerKey::SignerByAddress(addr.clone());
-    env.storage().instance().has(&signer_key)
+    let signers: soroban_sdk::Map<Address, ()> = env
+        .storage()
+        .instance()
+        .get(&SIGNERS_KEY)
+        .unwrap_or_else(|| soroban_sdk::Map::new(env));
+    signers.contains_key(addr.clone())
+}
+
+/// Number of currently registered signers (admin is never stored in the
+/// signer registry; revocation proposals against the admin need only one
+/// additional vote, handled by the 0-count default in the threshold fn).
+fn _signer_count(env: &Env) -> u32 {
+    let signers: soroban_sdk::Map<Address, ()> = env
+        .storage()
+        .instance()
+        .get(&SIGNERS_KEY)
+        .unwrap_or_else(|| soroban_sdk::Map::new(env));
+    signers.len()
 }
 
 /// Helper function to calculate the revocation threshold.
 fn _revocation_threshold(env: &Env) -> u32 {
-    let signer_count: u32 = env.storage().instance().get(&SIGNERS_KEY).unwrap_or(0u32);
+    let signer_count: u32 = env
+        .storage()
+        .instance()
+        .get::<_, Map<Address, ()>>(&SIGNERS_KEY)
+        .map(|signers| signers.len())
+        .unwrap_or(0u32);
     if signer_count == 0 { 1 } else { signer_count / 2 + 1 }
+}
+
+fn _effective_quorum(env: &Env, quorum: u32) -> u32 {
+    let signer_count = env
+        .storage()
+        .instance()
+        .get::<_, Map<Address, ()>>(&SIGNERS_KEY)
+        .map(|signers| signers.len())
+        .unwrap_or(0u32);
+    core::cmp::min(quorum, signer_count.max(1))
+}
+
+fn _signer_set_hash(env: &Env, signers: &Map<Address, ()>) -> BytesN<32> {
+    let mut encoded = Bytes::new(env);
+    for signer in signers.keys().iter() {
+        encoded.append(&signer.to_xdr(env));
+    }
+    env.crypto().sha256(&encoded)
 }
 
 // ── Emergency key revocation ─────────────────────────────────────────────
@@ -88,6 +198,7 @@ fn _revocation_threshold(env: &Env) -> u32 {
 /// Kept for the Issue #410 typed storage-key symbol audit; no longer used to
 /// read/write proposals directly (see `EMERGENCY_REVOCATION_TEMP_KEY`).
 pub(crate) const EMERGENCY_REVOCATION_KEY: Symbol = symbol_short!("EMERREV");
+const EMERGENCY_REVOCATION_QUORUM_KEY: Symbol = symbol_short!("EMREVQ");
 
 /// Proposal raised by the multi-sig coordinator group to revoke a hot-wallet key.
 ///
@@ -130,6 +241,23 @@ pub struct AdminChangeProposal {
     pub proposed_at: u64,
 }
 
+/// Lifecycle state for a multi-sig proposal approval window.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProposalState {
+    Active,
+    Expired,
+}
+
+/// Returns whether the proposal is still inside the 7-day approval window.
+pub fn proposal_state(env: &Env, proposed_at: u64) -> ProposalState {
+    if env.ledger().timestamp().saturating_sub(proposed_at) >= PROPOSAL_EXPIRY_SECONDS {
+        ProposalState::Expired
+    } else {
+        ProposalState::Active
+    }
+}
+
 fn execute_emergency_revocation(
     env: &Env,
     data: ContractData,
@@ -140,10 +268,27 @@ fn execute_emergency_revocation(
 
     let signer_key = SignerKey::SignerByAddress(proposal.target.clone());
     env.storage().instance().remove(&signer_key);
+
+    let mut updated_signers = env
+        .storage()
+        .instance()
+        .get::<_, Map<Address, ()>>(&SIGNERS_KEY)
+        .unwrap_or_else(|| Map::new(env));
+    updated_signers.remove(proposal.target.clone());
     if proposal.replacement != proposal.target {
         let replacement_key = SignerKey::SignerByAddress(proposal.replacement.clone());
         env.storage().instance().set(&replacement_key, &true);
+        updated_signers.set(proposal.replacement.clone(), ());
     }
+    env.storage().instance().set(&SIGNERS_KEY, &updated_signers);
+
+    let updated_signer_set_hash = _signer_set_hash(env, &updated_signers);
+    let original_quorum: u32 = env
+        .storage()
+        .temporary()
+        .get(&EMERGENCY_REVOCATION_QUORUM_KEY)
+        .unwrap_or_else(|| _revocation_threshold(env));
+    let updated_quorum = _effective_quorum(env, original_quorum);
 
     let mut contract_data = data;
     if contract_data.admin == proposal.target {
@@ -151,6 +296,12 @@ fn execute_emergency_revocation(
         env.storage().instance().set(&DATA_KEY, &contract_data);
     }
 
+    env.events().publish(
+        (Symbol::new(env, "SignerRevokedEmergency"),),
+        (proposal.target, updated_signer_set_hash, updated_quorum),
+    );
+
+    env.storage().temporary().remove(&EMERGENCY_REVOCATION_QUORUM_KEY);
     remove_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY);
 }
 
@@ -169,7 +320,7 @@ pub fn propose_emergency_revocation(
     replacement: Address,
     nonce: u64,
 ) -> Result<(), ContractError> {
-    crate::staging::check_staging_access(env, &current_admin)?;
+    crate::staging::check_staging_access(env, &proposer)?;
     let data: ContractData = env
         .storage()
         .instance()
@@ -187,7 +338,12 @@ pub fn propose_emergency_revocation(
         return Err(ContractError::Unauthorized);
     }
     proposer.require_auth();
-    consume_admin_nonce(env, &proposer, AdminAction::ProposeEmergencyRevocation, nonce)?;
+    consume_admin_nonce(
+        env,
+        &proposer,
+        AdminAction::ProposeEmergencyRevocation,
+        nonce,
+    )?;
 
     // Guard: only one active emergency proposal at a time.
     if has_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY) {
@@ -211,11 +367,18 @@ pub fn propose_emergency_revocation(
         proposed_at: env.ledger().timestamp(),
         votes,
     };
+    let quorum = _revocation_threshold(env);
+    env.storage().temporary().set(&EMERGENCY_REVOCATION_QUORUM_KEY, &quorum);
 
-    if proposal.votes.len() >= _revocation_threshold(env) {
+    if proposal.votes.len() >= _effective_quorum(env, quorum) {
         execute_emergency_revocation(env, data, proposal);
     } else {
-        store_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY, &proposal, DEFAULT_PROPOSAL_TTL);
+        store_temp_proposal(
+            env,
+            &EMERGENCY_REVOCATION_TEMP_KEY,
+            &proposal,
+            DEFAULT_PROPOSAL_TTL,
+        );
     }
 
     Ok(())
@@ -261,8 +424,15 @@ pub fn vote_emergency_revocation(
     }
     consume_admin_nonce(env, &voter, AdminAction::VoteEmergencyRevocation, nonce)?;
 
-    let mut proposal: EmergencyRevocationProposal = get_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY)
-        .ok_or(ContractError::NoActiveEmergencyRevocation)?;
+    let mut proposal: EmergencyRevocationProposal =
+        get_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY)
+            .ok_or(ContractError::NoActiveEmergencyRevocation)?;
+
+    if proposal_state(env, proposal.proposed_at) == ProposalState::Expired {
+        env.storage().temporary().remove(&EMERGENCY_REVOCATION_QUORUM_KEY);
+        remove_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY);
+        return Err(ContractError::NoActiveEmergencyRevocation);
+    }
 
     // Prevent double-voting.
     for i in 0..proposal.votes.len() {
@@ -278,13 +448,23 @@ pub fn vote_emergency_revocation(
 
     proposal.votes.push_back(voter);
 
-    let threshold = _revocation_threshold(env);
+    let original_quorum: u32 = env
+        .storage()
+        .temporary()
+        .get(&EMERGENCY_REVOCATION_QUORUM_KEY)
+        .unwrap_or_else(|| _revocation_threshold(env));
+    let threshold = _effective_quorum(env, original_quorum);
 
     if proposal.votes.len() >= threshold {
         execute_emergency_revocation(env, data, proposal);
     } else {
         // Threshold not yet reached — persist the updated vote tally.
-        store_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY, &proposal, EXTENDED_PROPOSAL_TTL);
+        store_temp_proposal(
+            env,
+            &EMERGENCY_REVOCATION_TEMP_KEY,
+            &proposal,
+            EXTENDED_PROPOSAL_TTL,
+        );
     }
 
     Ok(())
@@ -295,7 +475,13 @@ pub fn vote_emergency_revocation(
 /// Returns the active emergency revocation proposal, if one exists.
 /// Proposals are stored in temporary storage and will auto-purge after TTL.
 pub fn get_emergency_revocation_proposal(env: &Env) -> Option<EmergencyRevocationProposal> {
-    get_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY)
+    let proposal: EmergencyRevocationProposal =
+        get_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY)?;
+    if proposal_state(env, proposal.proposed_at) == ProposalState::Expired {
+        None
+    } else {
+        Some(proposal)
+    }
 }
 
 /// Returns `true` if `addr` has been stamped as revoked.
@@ -339,6 +525,7 @@ pub fn purge_emergency_revocation_proposal(env: &Env) -> Result<(), ContractErro
         .ok_or(ContractError::NotInitialized)?;
 
     if has_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY) {
+        env.storage().temporary().remove(&EMERGENCY_REVOCATION_QUORUM_KEY);
         remove_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY);
     }
 
@@ -350,7 +537,10 @@ pub fn purge_emergency_revocation_proposal(env: &Env) -> Result<(), ContractErro
 /// Returns true only if the proposal exists in temporary storage and hasn't expired
 /// according to Soroban's TTL mechanism.
 pub fn has_active_emergency_revocation(env: &Env) -> bool {
-    has_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY)
+    match get_temp_proposal::<EmergencyRevocationProposal>(env, &EMERGENCY_REVOCATION_TEMP_KEY) {
+        Some(proposal) => proposal_state(env, proposal.proposed_at) == ProposalState::Active,
+        None => false,
+    }
 }
 
 // ─── Issue #429: Two-phase ownership transfer ────────────────────────────────
@@ -373,7 +563,12 @@ pub fn propose_ownership_transfer(
         return Err(ContractError::NotAdmin);
     }
     current_admin.require_auth();
-    consume_admin_nonce(env, &current_admin, AdminAction::ProposeOwnershipTransfer, nonce)?;
+    consume_admin_nonce(
+        env,
+        &current_admin,
+        AdminAction::ProposeOwnershipTransfer,
+        nonce,
+    )?;
 
     if env.storage().instance().has(&PENDING_OWNER_KEY) {
         return Err(ContractError::TransferAlreadyPending);
@@ -462,10 +657,7 @@ pub fn propose_admin_change(
 /// Phase 2 — path A: a registered cosigner independently approves the change.
 /// Executes the admin key change immediately without waiting for the timelock.
 /// The cosigner must be distinct from the proposer.
-pub fn countersign_admin_change(
-    env: &Env,
-    cosigner: Address,
-) -> Result<(), ContractError> {
+pub fn countersign_admin_change(env: &Env, cosigner: Address) -> Result<(), ContractError> {
     let proposal: AdminChangeProposal = env
         .storage()
         .instance()
@@ -492,25 +684,25 @@ pub fn countersign_admin_change(
     contract_data.admin = proposal.new_admin;
     env.storage().instance().set(&DATA_KEY, &contract_data);
     env.storage().instance().remove(&PENDING_ADMIN_KEY);
-    crate::core::instance::bump_instance_ttl(env);
+    crate::instance::bump_instance_ttl(env);
     Ok(())
 }
 
 /// Phase 2 — path B: execute the admin change after the 24-hour timelock has elapsed.
 /// No secondary signature required; the delay itself acts as the verification window.
-pub fn execute_admin_change_by_timelock(
-    env: &Env,
-    executor: Address,
-) -> Result<(), ContractError> {
+pub fn execute_admin_change_by_timelock(env: &Env, executor: Address) -> Result<(), ContractError> {
     let proposal: AdminChangeProposal = env
         .storage()
         .instance()
         .get(&PENDING_ADMIN_KEY)
         .ok_or(ContractError::NoAdminChangePending)?;
 
-    let elapsed = env.ledger().timestamp().saturating_sub(proposal.proposed_at);
+    let elapsed = env
+        .ledger()
+        .timestamp()
+        .saturating_sub(proposal.proposed_at);
     if elapsed < ADMIN_CHANGE_TIMELOCK_SECONDS {
-        return Err(ContractError::AdminChangeTimelockNotSatisfied);
+        return Err(ContractError::AdminTimelockNotSatisfied);
     }
 
     let data: ContractData = env
@@ -534,10 +726,7 @@ pub fn execute_admin_change_by_timelock(
 
 /// Cancel a pending admin change. Only the current admin can cancel.
 /// Provides an emergency stop if the proposer's key was compromised.
-pub fn cancel_admin_change(
-    env: &Env,
-    canceller: Address,
-) -> Result<(), ContractError> {
+pub fn cancel_admin_change(env: &Env, canceller: Address) -> Result<(), ContractError> {
     let _proposal: AdminChangeProposal = env
         .storage()
         .instance()
@@ -568,7 +757,12 @@ pub fn get_pending_admin_change(env: &Env) -> Option<AdminChangeProposal> {
 // ── Emergency pause ───────────────────────────────────────────────────────
 
 /// Emergency stop: verified admin sets the global is_paused flag.
-pub fn set_paused(env: &Env, caller: Address, paused: bool, nonce: u64) -> Result<(), ContractError> {
+pub fn set_paused(
+    env: &Env,
+    caller: Address,
+    paused: bool,
+    nonce: u64,
+) -> Result<(), ContractError> {
     let data: ContractData = env
         .storage()
         .instance()
@@ -735,12 +929,9 @@ mod issue_410_tests {
         let contract_id = env.register_contract(None, crate::TimeLockedUpgradeContract);
 
         env.as_contract(&contract_id, || {
-            let slot_value: Option<u64> = load_admin_slot_with_auth(
-                &env,
-                &admin,
-                AdminStorageKey::ContractData,
-            )
-            .expect("helper should not error on empty slot");
+            let slot_value: Option<u64> =
+                load_admin_slot_with_auth(&env, &admin, AdminStorageKey::ContractData)
+                    .expect("helper should not error on empty slot");
             assert_eq!(slot_value, None);
         });
     }
@@ -759,12 +950,9 @@ mod issue_410_tests {
                 .instance()
                 .set(&AdminStorageKey::PendingAdmin.symbol(), &7u64);
 
-            let value: Option<u64> = load_admin_slot_with_auth(
-                &env,
-                &admin,
-                AdminStorageKey::PendingAdmin,
-            )
-            .expect("helper should not error on populated slot");
+            let value: Option<u64> =
+                load_admin_slot_with_auth(&env, &admin, AdminStorageKey::PendingAdmin)
+                    .expect("helper should not error on populated slot");
             assert_eq!(value, Some(7u64));
         });
     }
